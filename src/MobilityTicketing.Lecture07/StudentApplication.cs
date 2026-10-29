@@ -1,6 +1,9 @@
+using Microsoft.EntityFrameworkCore;
+using MobilityTicketing.Lecture07.Commands;
 using MobilityTicketing.Lecture07.Contracts;
 using MobilityTicketing.Lecture07.Data;
 using MobilityTicketing.Lecture07.Diagnostics;
+using MobilityTicketing.Lecture07.Queries;
 
 namespace MobilityTicketing.Lecture07;
 
@@ -14,16 +17,69 @@ public sealed class StudentApplication(string connection, TimeProvider? clock = 
     public LectureDbContext CreateContext() => LectureDbContext.Create(Connection, measurement: Measurement);
 
     // Connect your command and query classes here.
-    public Task<List<RouteOverviewDto>> ReadOverviewAsync(TimeWindow window, CancellationToken ct = default) =>
-        throw new NotImplementedException("Implement the live route-board query.");
-    public Task<CancelResult> CancelTripAsync(string tripId, CancellationToken ct = default) =>
-        throw new NotImplementedException("Implement trip cancellation.");
-    public Task<RenameResult> RenameRouteAsync(string routeId, string name, CancellationToken ct = default) =>
-        throw new NotImplementedException("Implement route renaming.");
-    public Task<BookingResult> BookTripAsync(string tripId, string requestId, CancellationToken ct = default) =>
-        throw new NotImplementedException("Implement booking and request retries.");
-    public Task<PublishResult> PublishSnapshotAsync(string snapshotId, TimeWindow window, CancellationToken ct = default) =>
-        throw new NotImplementedException("Design the snapshot storage and implement publication.");
-    public Task<PublishedSnapshot> ReadSnapshotAsync(string snapshotId, CancellationToken ct = default) =>
-        throw new NotImplementedException("Implement the published-plan query.");
+    public async Task<List<RouteOverviewDto>> ReadOverviewAsync(TimeWindow window, CancellationToken ct = default)
+    {
+        window.Validate();
+        await using var db =  CreateContext();
+        return await LiveBoardQuery.ExecuteAsync(db, window, ct);
+    }
+    
+    public async Task<CancelResult> CancelTripAsync(string tripId, CancellationToken ct = default) =>
+        await CancelTripCommand.ExecuteAsync(Connection, tripId, ct);
+
+    public async Task<RenameResult> RenameRouteAsync(string routeId, string name, CancellationToken ct = default) =>
+        await RenameRouteCommand.ExecuteAsync(Connection, routeId, name, ct);
+    
+    public Task<BookingResult> BookTripAsync(
+        string tripId,
+        string requestId,
+        CancellationToken ct = default) =>
+        BookTripCommand.ExecuteAsync(Connection, Clock, tripId, requestId, ct);
+    
+    
+    public async Task<PublishResult> PublishSnapshotAsync(
+        string snapshotId,
+        TimeWindow window,
+        CancellationToken ct = default) =>
+        await PublishSnapshotCommand.ExecuteAsync(
+            Connection, Clock, Hooks.BeforePublishCommit, snapshotId, window, ct);
+
+    
+    public async Task<PublishedSnapshot> ReadSnapshotAsync(
+        string snapshotId,
+        CancellationToken ct = default)
+    {
+        DatabaseSession.RequireText(snapshotId,  nameof(snapshotId));
+        await using var db = CreateContext();
+
+        var plan = await db.PublishedPlans
+            .AsNoTracking()
+            .Where(x => x.Id == snapshotId)
+            .Select(x => new
+            {
+                x.Id,
+                x.FromUtc,
+                x.ToUtc,
+                x.PublishedAtUtc,
+                Routes = x.Routes
+                    .OrderBy(r => r.RouteId)
+                    .Select(r => new RouteOverviewDto(
+                        r.RouteId,
+                        r.RouteName,
+                        r.ScheduledTripCount,
+                        r.NextDepartureUtc))
+                    .ToList()
+            })
+            .SingleOrDefaultAsync(ct);
+
+        if (plan is null)
+            throw new SnapshotNotFoundException(snapshotId);
+
+        return new PublishedSnapshot(
+            plan.Id,
+            new TimeWindow(plan.FromUtc, plan.ToUtc),
+            plan.PublishedAtUtc,
+            plan.Routes);
+    }
+
 }
